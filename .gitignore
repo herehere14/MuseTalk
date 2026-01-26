@@ -1,18 +1,100 @@
-.DS_Store
-*.log
-.idea/
-.vscode/
+# Python
+####################################
+__pycache__/
 *.pyc
-.ipynb_checkpoints
-results/
-models/
-**/__pycache__/
-*.py[cod]
-*$py.class
+*.pyo
+*.pyd
+*.so
+
+####################################
+# Jupyter / Notebooks
+####################################
+.ipynb_checkpoints/
+*.ipynb~
+
+####################################
+# Virtual Environments / Conda
+####################################
+venv/
+.env
+.env.*
+.venv/
+conda/
+.conda/
+miniconda/
+miniconda3/
+Miniconda3-latest-*.sh
+
+####################################
+# ML / AI Artifacts
+####################################
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+*.bin
+
+# Audio / Video outputs
+*.wav
+*.mp3
+*.flac
+*.mp4
+*.avi
+*.mkv
+
+# Data folders
+data/
 dataset/
-ffmpeg*
-ffmprobe*
-ffplay*
-debug
-exp_out
-.gradio
+datasets/
+nltk_data/
+outputs/
+logs/
+
+####################################
+# Torch / TensorFlow cache
+####################################
+.torch/
+torch_extensions/
+.keras/
+.tensorflow/
+wandb/
+
+####################################
+# OS / System
+####################################
+.cache/
+.DS_Store
+Thumbs.db
+
+####################################
+# Shell / Server junk (IMPORTANT)
+####################################
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.wget-hsts
+.sudo_as_admin_successful
+
+####################################
+# SSH / Credentials (CRITICAL)
+####################################
+.ssh/
+.gitconfig
+
+####################################
+# Editors / IDEs
+####################################
+.vscode/
+.idea/
+*.swp
+*.swo
+
+####################################
+# Misc
+####################################
+*.log
+*.tmp
+*.bak

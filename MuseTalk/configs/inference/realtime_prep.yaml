@@ -1,0 +1,9 @@
+# 1. The ID to use
+avatar_id: "bank_avatar_1"
+
+# 2. The Settings for that ID (MUST BE NESTED)
+bank_avatar_1:
+  video_path: "data/video/bank_avatar_25fps.mp4"
+  bbox_shift: -5
+  batch_size: 4
+  preparation: True  # <--- Build the cache

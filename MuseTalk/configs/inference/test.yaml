@@ -1,0 +1,10 @@
+task_0:
+ video_path: "data/video/yongen.mp4"
+ audio_path: "data/audio/yongen.wav"
+
+task_1:
+ video_path: "data/video/bank_avatar_25fps.mp4"
+ audio_path: "data/audio/commercial_audio_16k.wav"
+ bbox_shift: -5
+  
+

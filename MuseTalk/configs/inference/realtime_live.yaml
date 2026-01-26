@@ -1,0 +1,8 @@
+# "Live" Config for the Warm Server
+avatar_id: "bank_avatar_1"
+video_path: "data/video/bank_avatar_25fps.mp4"
+bbox_shift: -5
+batch_size: 4
+preparation: False  # <--- Fast Mode! Uses the cache you built earlier
+audio_clips:
+  - "data/audio/commercial_audio_16k.wav" # Dummy path (Server overrides this)
