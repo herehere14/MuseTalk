@@ -1,3 +1,4 @@
+#temp_prep.yaml
 bank_avatar_1:
   video_path: "results/bank_avatar_hd.mp4"
   bbox_shift: -5

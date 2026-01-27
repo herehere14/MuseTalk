@@ -1,20 +1,47 @@
-diffusers==0.30.2
-accelerate==0.28.0
+# --- Core Deep Learning (Pinned for MuseTalk Stability) ---
+torch==2.0.1
+torchvision==0.15.2
+torchaudio==2.0.2
 numpy==1.23.5
-tensorflow==2.12.0
-tensorboard==2.12.0
-opencv-python==4.9.0.80
-soundfile==0.12.1
+
+# --- MuseTalk Critical Dependencies ---
+diffusers==0.24.0
+accelerate==0.28.0
 transformers==4.39.2
-huggingface_hub==0.30.2
-librosa==0.11.0
-einops==0.8.1
-gradio==5.24.0
+huggingface_hub==0.22.2
+einops==0.8.0
+omegaconf==2.3.0
 
-gdown
-requests
+# --- Audio & Media Processing ---
+librosa==0.10.1
+soundfile==0.12.1
 imageio[ffmpeg]
-
-omegaconf
 ffmpeg-python
 moviepy
+pydub
+
+# --- OpenMMLab (Face Detection & Parsing) ---
+openmim
+mmengine
+mmcv==2.0.1
+mmdet==3.1.0
+mmpose==1.1.0
+
+# --- Text-to-Speech (VoiceEngine) ---
+# Installing directly from Git to fix missing metadata issue
+melo @ git+https://github.com/myshell-ai/MeloTTS.git
+unidic-lite
+
+# --- Utilities & Server ---
+requests
+gdown
+tensorboard==2.12.0
+uvicorn
+fastapi
+pydantic
+
+# --- Downgraded to prevent forcing HuggingFace upgrade ---
+gradio==4.16.0
+
+#pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu118 --} also run this
+# python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng'); nltk.download('cmudict')" --} run this

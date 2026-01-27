@@ -1,3 +1,4 @@
+#realtime.yaml
 avator_1:
  preparation: True # your can set it to False if you want to use the existing avator, it will save time
  bbox_shift: 5

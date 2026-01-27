@@ -2,15 +2,15 @@ import torch
 import os
 import numpy as np
 import cv2
-import subprocess
+import subprocess  # <--- THIS WAS MISSING
 import pickle
 import glob
 from tqdm import tqdm
+from PIL import Image
 
 # Import Utils
 from musetalk.utils.utils import load_all_model
 from musetalk.utils.audio_processor import AudioProcessor
-from musetalk.utils.blending import get_image_blending
 from musetalk.utils.preprocessing import read_imgs
 from transformers import WhisperModel
 
@@ -65,25 +65,20 @@ class RealTimeInference:
         self.audio_processor = AudioProcessor(feature_extractor_path=self.whisper_dir)
         self.whisper_model = WhisperModel.from_pretrained(self.whisper_dir).to(self.device, dtype=self.model_dtype).eval()
 
-        # 4. Load Cache (Latents, Coords, and MASKS)
+        # 4. Load Cache
         print(f"    -> Loading Cache Files...")
-        
-        # Load Latents
         raw_loaded = torch.load(self.latents_path)
         if isinstance(raw_loaded, list):
             self.input_latents = [t.to(self.device, dtype=self.model_dtype) for t in raw_loaded]
         else:
             self.input_latents = raw_loaded.to(self.device, dtype=self.model_dtype)
         
-        # Load Face Coordinates
         with open(self.coords_path, "rb") as f:
             self.input_coords = pickle.load(f)
 
-        # Load Mask Coordinates
         with open(self.mask_coords_path, "rb") as f:
             self.mask_coords_list = pickle.load(f)
 
-        # Load Mask Images (for blending)
         input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
         input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         self.mask_list = read_imgs(input_mask_list)
@@ -93,12 +88,89 @@ class RealTimeInference:
     def read_video(self, path):
         frames = []
         cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            print(f"❌ Error: Could not open video file: {path}")
+            return []
         while True:
             ret, frame = cap.read()
             if not ret: break
             frames.append(frame)
         cap.release()
         return frames
+
+    def safe_blending(self, full_frame, face_img, face_box, mask_img, crop_box):
+        """
+        A robust blending function that handles edge-of-screen cases explicitly.
+        """
+        try:
+            # Convert to PIL
+            body = Image.fromarray(full_frame[:, :, ::-1]) # BGR to RGB
+            face = Image.fromarray(face_img[:, :, ::-1])
+            if mask_img is not None:
+                mask = Image.fromarray(mask_img).convert("L")
+            else:
+                # Create a default white mask if none provided
+                mask = Image.new("L", face.size, 255)
+
+            # Dimensions
+            img_w, img_h = body.size
+            x, y, x1, y1 = face_box
+            cx_s, cy_s, cx_e, cy_e = crop_box # The larger box used for blending context
+
+            # 1. Calculate the 'Safe' Crop Box (clamped to image bounds)
+            safe_cx_s = max(0, cx_s)
+            safe_cy_s = max(0, cy_s)
+            safe_cx_e = min(img_w, cx_e)
+            safe_cy_e = min(img_h, cy_e)
+
+            # If the safe box is invalid (e.g. fully off screen), return original
+            if safe_cx_e <= safe_cx_s or safe_cy_e <= safe_cy_s:
+                return full_frame
+
+            # 2. Crop the Background (Safe area only)
+            bg_crop = body.crop((safe_cx_s, safe_cy_s, safe_cx_e, safe_cy_e))
+            bg_w, bg_h = bg_crop.size
+
+            # 3. We need to figure out which part of the 'face' and 'mask' corresponds to this safe area
+            # The 'face' variable currently holds the generated face which corresponds to (x, y, x1, y1)
+            # But the blending expects to paste it into the 'crop_box'.
+            
+            # Create a canvas the size of 'crop_box' (unclamped) to arrange elements
+            # Then we will crop IT to match the safe area.
+            crop_w = cx_e - cx_s
+            crop_h = cy_e - cy_s
+            
+            # Canvas for Face
+            face_canvas = Image.new("RGB", (crop_w, crop_h), (0,0,0))
+            # Paste the generated face onto the canvas at its relative position
+            # Face is at (x, y), Crop is at (cx_s, cy_s) -> Offset is (x - cx_s, y - cy_s)
+            face_offset_x = x - cx_s
+            face_offset_y = y - cy_s
+            face_canvas.paste(face, (face_offset_x, face_offset_y))
+
+            # Canvas for Mask
+            mask_canvas = Image.new("L", (crop_w, crop_h), 0)
+            mask_canvas.paste(mask, (face_offset_x, face_offset_y))
+
+            # 4. Now crop the Canvases to match the 'Safe' Background Crop
+            # The safe crop starts at (safe_cx_s - cx_s, safe_cy_s - cy_s) relative to the crop box
+            rel_x = safe_cx_s - cx_s
+            rel_y = safe_cy_s - cy_s
+            
+            face_patch = face_canvas.crop((rel_x, rel_y, rel_x + bg_w, rel_y + bg_h))
+            mask_patch = mask_canvas.crop((rel_x, rel_y, rel_x + bg_w, rel_y + bg_h))
+
+            # 5. Paste safely
+            bg_crop.paste(face_patch, (0, 0), mask_patch)
+            
+            # 6. Put the patch back into the main image
+            body.paste(bg_crop, (safe_cx_s, safe_cy_s))
+
+            return np.array(body)[:, :, ::-1] # RGB to BGR
+
+        except Exception as e:
+            print(f"⚠️ Safe Blending Failed: {e}")
+            return full_frame
 
     @torch.no_grad()
     def run(self, audio_path, output_video_path):
@@ -119,6 +191,10 @@ class RealTimeInference:
         total_frames = whisper_chunks.shape[0]
         cache_len = len(self.input_latents)
         bg_len = len(self.bg_frames)
+
+        if bg_len == 0:
+            print("❌ Error: Background video frames are empty. Check your config video_path.")
+            return None
         
         print(f"    -> Rendering {total_frames} frames...")
         
@@ -135,7 +211,7 @@ class RealTimeInference:
             else:
                 ref_latent = raw_latent
 
-            # --- FORCE PIXEL MASKING ---
+            # --- MASKING ---
             if hasattr(self.vae, 'vae'):
                 pixel_img = self.vae.vae.decode(ref_latent / 0.18215).sample
             else:
@@ -173,29 +249,18 @@ class RealTimeInference:
             face_crop = face_crop.cpu().numpy().astype(np.uint8)
             face_crop = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
             
-            # --- BLENDING & PASTING (THE FIX) ---
+            # --- ROBUST BLENDING ---
             # 1. Get corresponding background frame
             full_frame = self.bg_frames[bg_idx].copy()
             
-            # 2. Get coordinates and masks for this frame
+            # 2. Get coordinates and masks
             bbox = self.input_coords[frame_idx % len(self.input_coords)]
             mask = self.mask_list[frame_idx % len(self.mask_list)]
             mask_crop_box = self.mask_coords_list[frame_idx % len(self.mask_coords_list)]
 
-            try:
-                # 3. Use MuseTalk's official blending function
-                # This handles resizing and soft blending automatically
-                final_frame = get_image_blending(
-                    full_frame,
-                    face_crop,
-                    bbox,
-                    mask,
-                    mask_crop_box
-                )
-                video_frames.append(final_frame)
-            except Exception as e:
-                print(f"Blending error at frame {i}: {e}")
-                video_frames.append(full_frame) # Fallback to original frame
+            # 3. Call Safe Blending
+            final_frame = self.safe_blending(full_frame, face_crop, bbox, mask, mask_crop_box)
+            video_frames.append(final_frame)
 
         # 3. Save & Merge Audio
         temp_video = output_video_path.replace(".mp4", "_silent.mp4")
@@ -208,7 +273,7 @@ class RealTimeInference:
             
             print("    -> Merging Audio...")
             cmd = f"ffmpeg -y -i {temp_video} -i {audio_path} -c:v copy -c:a aac -strict experimental {output_video_path}"
-            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL) # Allow errors to show if needed
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL) 
             
             if os.path.exists(temp_video): os.remove(temp_video)
             

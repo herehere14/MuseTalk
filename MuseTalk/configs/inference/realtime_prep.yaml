@@ -1,9 +1,9 @@
-# 1. The ID to use
-avatar_id: "bank_avatar_1"
-
-# 2. The Settings for that ID (MUST BE NESTED)
+#realtime_prep.yaml
 bank_avatar_1:
   video_path: "data/video/bank_avatar_25fps.mp4"
-  bbox_shift: -5
+  bbox_shift: 0
   batch_size: 4
-  preparation: True  # <--- Build the cache
+  preparation: True
+  audio_clips:
+    # The script requires a dictionary (key: path), not a list
+    clip1: "data/audio/commercial_audio_16k.wav"
