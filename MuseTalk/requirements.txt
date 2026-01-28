@@ -7,18 +7,18 @@ numpy==1.23.5
 # --- MuseTalk Critical Dependencies ---
 diffusers==0.24.0
 accelerate==0.28.0
-transformers==4.39.2
+transformers==4.27.4
 huggingface_hub==0.22.2
 einops==0.8.0
 omegaconf==2.3.0
 
 # --- Audio & Media Processing ---
-librosa==0.10.1
+librosa==0.9.1
 soundfile==0.12.1
 imageio[ffmpeg]
 ffmpeg-python
 moviepy
-pydub
+pydub==0.25.1
 
 # --- OpenMMLab (Face Detection & Parsing) ---
 openmim
@@ -29,16 +29,17 @@ mmpose==1.1.0
 
 # --- Text-to-Speech (VoiceEngine) ---
 # Installing directly from Git to fix missing metadata issue
-melo @ git+https://github.com/myshell-ai/MeloTTS.git
+melotts @ git+https://github.com/myshell-ai/MeloTTS.git
 unidic-lite
 
 # --- Utilities & Server ---
 requests
 gdown
-tensorboard==2.12.0
+tensorboard==2.16.2
 uvicorn
 fastapi
 pydantic
+huggingface_hub<0.22.0
 
 # --- Downgraded to prevent forcing HuggingFace upgrade ---
 gradio==4.16.0
