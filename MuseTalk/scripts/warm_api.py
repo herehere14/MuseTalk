@@ -37,6 +37,10 @@ class LowPass:
         self.y = a * float(x) + (1.0 - a) * self.y
         return self.y
 
+    def reset(self):
+        self.inited = False
+        self.y = 0.0
+
 
 class OneEuro:
     """
@@ -72,9 +76,18 @@ class OneEuro:
 
     def reset(self):
         """Reset filter state for new sequence"""
-        self.x_f = LowPass()
-        self.dx_f = LowPass()
+        self.x_f.reset()
+        self.dx_f.reset()
         self.last_x = None
+
+    def snap(self, x):
+        """Force filter to snap to a new value (bypass smoothing)"""
+        x = float(x)
+        self.x_f.inited = True
+        self.x_f.y = x
+        self.dx_f.reset()
+        self.last_x = x
+        return x
 
 
 class RealTimeInference:
@@ -96,6 +109,12 @@ class RealTimeInference:
         self.filter_beta_pos = 0.10
         self.filter_min_cutoff_size = 1.0  # For w, h (size)
         self.filter_beta_size = 0.08
+
+        # Snap Gating Tuning:
+        # - Higher threshold = less snapping, smoother but may lag
+        # - Lower threshold = more snapping, responsive but may jitter
+        self.snap_thresh = 12  # pixels - bypass smoothing if delta exceeds this
+        self.snap_enabled = True
         # ==========================================
 
         # --- PATHS ---
@@ -162,8 +181,13 @@ class RealTimeInference:
         self.mask_list = read_imgs(input_mask_list)
 
         # 5. Initialize One-Euro Filters for bbox smoothing
-        print("    -> Initializing One-Euro filters for bbox smoothing...")
+        print("    -> Initializing One-Euro filters with snap gating...")
         self._init_bbox_filters()
+
+        # 6. Build background bbox track using KLT optical flow
+        print("    -> Building background bbox track (KLT)...")
+        self.bg_bboxes = self._build_bg_bboxes_klt()
+        print(f"    -> Built {len(self.bg_bboxes)} bg bboxes")
 
         print(f"✅ Avatar '{self.avatar_id}' loaded with {len(self.mask_list)} masks!")
 
@@ -181,32 +205,160 @@ class RealTimeInference:
         self.f_w.reset()
         self.f_h.reset()
 
-    def _filter_bbox(self, x1, y1, x2, y2):
+    def _filter_bbox_with_snap(self, x1, y1, x2, y2):
         """
-        Apply One-Euro filter to bounding box coordinates.
-        Converts (x1,y1,x2,y2) -> (cx,cy,w,h) -> filter -> back to (x1,y1,x2,y2)
+        Apply One-Euro filter to bounding box with snap gating.
+        Snap gating bypasses smoothing when movement exceeds threshold (fast head turns).
         """
         dt = 1.0 / self.video_fps
 
-        # Convert to center + size
-        cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
-        w = (x2 - x1)
-        h = (y2 - y1)
+        # Convert raw bbox to center + size
+        cx_raw = (x1 + x2) * 0.5
+        cy_raw = (y1 + y2) * 0.5
+        w_raw = (x2 - x1)
+        h_raw = (y2 - y1)
 
         # Apply One-Euro filter
-        cx = self.f_cx.update(cx, dt)
-        cy = self.f_cy.update(cy, dt)
-        w = self.f_w.update(w, dt)
-        h = self.f_h.update(h, dt)
+        cx_filtered = self.f_cx.update(cx_raw, dt)
+        cy_filtered = self.f_cy.update(cy_raw, dt)
+        w_filtered = self.f_w.update(w_raw, dt)
+        h_filtered = self.f_h.update(h_raw, dt)
 
-        # Convert back to corner format
-        x1f = int(cx - w * 0.5)
-        y1f = int(cy - h * 0.5)
-        x2f = int(cx + w * 0.5)
-        y2f = int(cy + h * 0.5)
+        # --- SNAP GATING ---
+        # If the raw position moved too far from filtered, snap to raw (fast head turn)
+        if self.snap_enabled:
+            delta = abs(cx_filtered - cx_raw) + abs(cy_filtered - cy_raw)
+
+            if delta > self.snap_thresh:
+                # Bypass smoothing - snap to raw values
+                cx_filtered = cx_raw
+                cy_filtered = cy_raw
+                w_filtered = w_raw
+                h_filtered = h_raw
+
+                # Reset filters to the snapped position to avoid oscillation
+                self.f_cx.snap(cx_raw)
+                self.f_cy.snap(cy_raw)
+                self.f_w.snap(w_raw)
+                self.f_h.snap(h_raw)
+
+        # Convert back to corner format (PATCH A: use round())
+        x1f = int(round(cx_filtered - w_filtered * 0.5))
+        y1f = int(round(cy_filtered - h_filtered * 0.5))
+        x2f = int(round(cx_filtered + w_filtered * 0.5))
+        y2f = int(round(cy_filtered + h_filtered * 0.5))
 
         return (x1f, y1f, x2f, y2f)
+
+    def _clamp_bbox(self, bbox, W, H):
+        """Clamp bbox to image bounds and ensure minimum size."""
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(W - 1, x1))
+        y1 = max(0, min(H - 1, y1))
+        x2 = max(0, min(W - 1, x2))
+        y2 = max(0, min(H - 1, y2))
+        if x2 <= x1 + 2:
+            x2 = min(W - 1, x1 + 3)
+        if y2 <= y1 + 2:
+            y2 = min(H - 1, y1 + 3)
+        return (x1, y1, x2, y2)
+
+    def _build_bg_bboxes_klt(self, max_pts=120, min_pts=30):
+        """
+        Track bbox across bg_frames using KLT optical flow.
+        Returns list of bboxes (len == bg_len) in bg frame coordinates.
+        """
+        bboxes = []
+        bg_len = len(self.bg_frames)
+        if bg_len == 0:
+            return bboxes
+
+        H, W = self.bg_frames[0].shape[:2]
+
+        # Start bbox from coords that correspond to bg frame 0 time.
+        # (Assumes avatar was built from the SAME bg video. If not, rebuild avatar cache.)
+        x1, y1, x2, y2 = [int(v) for v in self.input_coords[0]]
+        bbox = self._clamp_bbox((x1, y1, x2, y2), W, H)
+
+        prev = cv2.cvtColor(self.bg_frames[0], cv2.COLOR_BGR2GRAY)
+
+        def init_points(gray, bb):
+            x1, y1, x2, y2 = bb
+            roi = gray[y1:y2, x1:x2]
+            if roi.size == 0:
+                return None
+            pts = cv2.goodFeaturesToTrack(
+                roi,
+                maxCorners=max_pts,
+                qualityLevel=0.01,
+                minDistance=6,
+                blockSize=7,
+            )
+            if pts is None:
+                return None
+            pts[:, 0, 0] += x1
+            pts[:, 0, 1] += y1
+            return pts
+
+        pts = init_points(prev, bbox)
+        bboxes.append(bbox)
+
+        lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+
+        for i in range(1, bg_len):
+            curr = cv2.cvtColor(self.bg_frames[i], cv2.COLOR_BGR2GRAY)
+
+            if pts is None or len(pts) < min_pts:
+                pts = init_points(prev, bbox)
+
+            if pts is None:
+                # fallback: keep last bbox
+                bboxes.append(bbox)
+                prev = curr
+                continue
+
+            nxt, st, err = cv2.calcOpticalFlowPyrLK(prev, curr, pts, None, **lk_params)
+            good_old = pts[st == 1]
+            good_new = nxt[st == 1]
+
+            if len(good_new) < min_pts:
+                bboxes.append(bbox)
+                prev = curr
+                pts = None
+                continue
+
+            # Median motion is robust to outliers
+            dx = np.median(good_new[:, 0] - good_old[:, 0])
+            dy = np.median(good_new[:, 1] - good_old[:, 1])
+
+            # Shift bbox by median motion
+            x1, y1, x2, y2 = bbox
+            x1_new = int(round(x1 + dx))
+            y1_new = int(round(y1 + dy))
+            x2_new = int(round(x2 + dx))
+            y2_new = int(round(y2 + dy))
+
+            bbox = self._clamp_bbox((x1_new, y1_new, x2_new, y2_new), W, H)
+            bboxes.append(bbox)
+
+            # Update points for next iteration
+            pts = good_new.reshape(-1, 1, 2)
+            prev = curr
+
+        return bboxes
+
+    # PATCH B: Helper to derive crop box from filtered bbox
+    def _crop_box_from_bbox(self, bbox, pad_ratio=0.45):
+        """Derive crop box from filtered bbox to ensure alignment."""
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = y2 - y1
+        pad = int(round(max(w, h) * pad_ratio))  # context margin
+        return (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
 
     def read_video(self, path):
         frames = []
@@ -313,12 +465,12 @@ class RealTimeInference:
             return None
 
         print(f"    -> Rendering {total_frames} frames...")
+        print(f"    -> Using KLT-tracked bboxes for stable blending")
 
         # FIX 1: SPEED SYNC (Ratio Calculation)
-        # e.g., 6050 (Cache) / 3025 (BG) = 2.0
         step = max(1, int(round(cache_len / bg_len)))
 
-        # Reset One-Euro filters for this new rendering session
+        # Reset One-Euro filters for this new rendering session (kept for optional use)
         self._reset_bbox_filters()
 
         for i in tqdm(range(total_frames)):
@@ -326,15 +478,11 @@ class RealTimeInference:
             bg_idx = i % bg_len
 
             # 2. Slave Clock: Cache Index (50fps)
-            # We multiply by 'step' to match the 25fps video speed.
-            # We add 'sync_offset' to fix any constant latency delay.
             frame_idx = (bg_idx * step) + self.sync_offset
 
             # 3. Handle Looping / Boundary Safety
-            # If offset pushes us negative, wrap to end
             if frame_idx < 0:
                 frame_idx = cache_len + frame_idx
-            # If offset pushes us past end, wrap to start
             if frame_idx >= cache_len:
                 frame_idx = frame_idx % cache_len
 
@@ -388,16 +536,17 @@ class RealTimeInference:
             # --- BLENDING ---
             full_frame = self.bg_frames[bg_idx].copy()
 
-            # Get raw bbox from coords.pkl
-            raw_bbox = self.input_coords[frame_idx]
-            x1_raw, y1_raw, x2_raw, y2_raw = [int(v) for v in raw_bbox]
+            # KLT FIX: Use pre-tracked bbox from background video
+            bbox = self.bg_bboxes[bg_idx]
+            # Optional: apply additional filtering (usually not needed if KLT is stable)
+            # bbox = self._filter_bbox_with_snap(*bbox)
 
-            # Apply One-Euro filter for smooth, adaptive bbox
-            bbox = self._filter_bbox(x1_raw, y1_raw, x2_raw, y2_raw)
             x, y, x1, y1 = bbox
 
             mask = self.mask_list[frame_idx]
-            mask_crop_box = self.mask_coords_list[frame_idx]
+
+            # PATCH B: Derive crop box from filtered bbox (guarantees alignment)
+            mask_crop_box = self._crop_box_from_bbox(bbox, pad_ratio=0.45)
 
             # --- FIX 3: RESIZE TO FIT (Dimension Mismatch) ---
             target_w = x1 - x
@@ -415,30 +564,28 @@ class RealTimeInference:
                 except Exception:
                     pass
 
+            # PATCH C: Proper mask handling (INTER_NEAREST + binarize)
             if mask is not None:
-                # Resize Mask
+                # If mask is 3-channel, take one channel
+                if mask.ndim == 3:
+                    mask = mask[:, :, 0]
+
+                # Resize with NEAREST to avoid gray alpha edges
                 if mask.shape[0] != target_h or mask.shape[1] != target_w:
                     try:
-                        mask = cv2.resize(mask, (target_w, target_h))
+                        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
                     except Exception:
                         pass
 
-                # --- FIX 4: CRASH & NOSE FIX ---
-                # Safely get dimensions (Handle both 2-channel and 3-channel masks)
-                if mask.ndim == 2:
-                    mh, mw = mask.shape
-                else:
-                    mh, mw = mask.shape[:2]
+                # Binarize to 0/255 (critical to prevent blending two mouths)
+                mask = (mask > 0).astype(np.uint8) * 255
 
-                # Hard-crop the top 70% of the mask to black.
-                top_boundary = int(mh * self.nose_crop)
+                # Nose crop (stays binary)
+                top_boundary = int(mask.shape[0] * self.nose_crop)
                 mask[:top_boundary, :] = 0
 
-                # DOUBLE SAFETY: Zero out the face_crop pixels themselves
-                if mask.ndim == 3:
-                     face_crop[mask[:,:,0] == 0] = 0
-                else:
-                     face_crop[mask == 0] = 0
+                # Zero face pixels based on mask (mask is now guaranteed 2D)
+                face_crop[mask == 0] = 0
 
             # D. Call Safe Blending
             final_frame = self.safe_blending(full_frame, face_crop, bbox, mask, mask_crop_box)
