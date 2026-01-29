@@ -23,8 +23,6 @@ def feather_composite(bg_roi, gen_roi, mask_255):
     """
     Feathered boundary blending using OpenCV morphology.
     Hard replace inside, feather only at the boundary.
-    bg_roi, gen_roi: HxWx3 uint8
-    mask_255: HxW uint8 (0 or 255)
     """
     m = (mask_255 > 0).astype(np.uint8) * 255
 
@@ -68,7 +66,6 @@ def poisson_blend(bg_roi, gen_roi, mask_255):
 def subpixel_shift(img, dx, dy):
     """
     Apply sub-pixel translation using warpAffine.
-    dx, dy: fractional pixel offsets (e.g., 0.3, -0.7)
     """
     if abs(dx) < 1e-4 and abs(dy) < 1e-4:
         return img
@@ -98,7 +95,6 @@ def subpixel_shift_mask(mask, dx, dy):
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0
     )
-    # Re-binarize (threshold at 128 to avoid soft edges from interpolation)
     return (shifted > 128).astype(np.uint8) * 255
 
 
@@ -179,10 +175,13 @@ class RealTimeInference:
         self.nose_crop = 0.7
         self.video_fps = 25
 
+        # Position filtering (direct, no motion integration)
         self.filter_min_cutoff_pos = 1.5
         self.filter_beta_pos = 0.10
-        self.filter_min_cutoff_size = 1.0
-        self.filter_beta_size = 0.08
+
+        # Size filtering (heavy smoothing)
+        self.filter_min_cutoff_size = 0.5
+        self.filter_beta_size = 0.02
 
         self.snap_thresh = 12
         self.snap_enabled = True
@@ -190,8 +189,16 @@ class RealTimeInference:
         # Blending Mode: 'feather' or 'poisson'
         self.blend_mode = 'feather'
 
-        # Sub-pixel alignment: eliminates 1px "micro slip" from float→int rounding
+        # Sub-pixel alignment
         self.subpixel_enabled = True
+
+        # Scale lock: freeze w/h to median after warmup
+        self.scale_lock_enabled = True
+        self.scale_lock_warmup_frames = 50
+
+        # Affine transform tracking (micro rotation/scale compensation)
+        self.affine_tracking_enabled = True
+        self.affine_num_points = 40
         # ==========================================
 
         # --- PATHS ---
@@ -252,58 +259,98 @@ class RealTimeInference:
         input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         self.mask_list = read_imgs(input_mask_list)
 
-        print("    -> Initializing One-Euro filters with snap gating...")
-        self._init_bbox_filters()
+        print("    -> Initializing position filters...")
+        self._init_filters()
 
-        print("    -> Building background bbox track (KLT)...")
-        self.bg_bboxes_float = self._build_bg_bboxes_klt_float()
-        print(f"    -> Built {len(self.bg_bboxes_float)} bg bboxes (float precision)")
+        print("    -> Building background bbox track with stabilization...")
+        self.bg_bboxes_float, self.affine_transforms = self._build_bg_bboxes_advanced()
+        print(f"    -> Built {len(self.bg_bboxes_float)} bg bboxes (filtered, scale-locked)")
 
         print(f"✅ Avatar '{self.avatar_id}' loaded with {len(self.mask_list)} masks!")
 
-    def _init_bbox_filters(self):
+    def _init_filters(self):
+        """Initialize One-Euro filters for direct position filtering"""
+        # Position filters (direct filtering, no integration)
         self.f_cx = OneEuro(min_cutoff=self.filter_min_cutoff_pos, beta=self.filter_beta_pos)
         self.f_cy = OneEuro(min_cutoff=self.filter_min_cutoff_pos, beta=self.filter_beta_pos)
+
+        # Size filters (heavy smoothing)
         self.f_w = OneEuro(min_cutoff=self.filter_min_cutoff_size, beta=self.filter_beta_size)
         self.f_h = OneEuro(min_cutoff=self.filter_min_cutoff_size, beta=self.filter_beta_size)
 
-    def _reset_bbox_filters(self):
+        # State for snap gating
+        self.prev_cx_raw = None
+        self.prev_cy_raw = None
+
+        # Scale lock state
+        self.w_samples = []
+        self.h_samples = []
+        self.w_locked = None
+        self.h_locked = None
+
+    def _reset_filters(self):
+        """Reset all filter states"""
         self.f_cx.reset()
         self.f_cy.reset()
         self.f_w.reset()
         self.f_h.reset()
 
-    def _filter_bbox_with_snap_float(self, x1, y1, x2, y2):
+        self.prev_cx_raw = None
+        self.prev_cy_raw = None
+
+        self.w_samples = []
+        self.h_samples = []
+        self.w_locked = None
+        self.h_locked = None
+
+    def _filter_position_direct(self, cx_raw, cy_raw, w_raw, h_raw, frame_idx):
         """
-        Apply One-Euro filter to bounding box with snap gating.
-        Returns FLOAT (cx, cy, w, h) to preserve sub-pixel precision.
+        Direct position filtering (no motion integration).
+        Anchored to raw KLT tracking each frame - prevents drift.
         """
         dt = 1.0 / self.video_fps
 
-        cx_raw = (x1 + x2) * 0.5
-        cy_raw = (y1 + y2) * 0.5
-        w_raw = float(x2 - x1)
-        h_raw = float(y2 - y1)
+        # Initialize on first frame
+        if self.prev_cx_raw is None:
+            self.prev_cx_raw = cx_raw
+            self.prev_cy_raw = cy_raw
 
-        cx_filtered = self.f_cx.update(cx_raw, dt)
-        cy_filtered = self.f_cy.update(cy_raw, dt)
-        w_filtered = self.f_w.update(w_raw, dt)
-        h_filtered = self.f_h.update(h_raw, dt)
+        # Snap gating for large movements
+        dx_raw = cx_raw - self.prev_cx_raw
+        dy_raw = cy_raw - self.prev_cy_raw
 
-        if self.snap_enabled:
-            delta = abs(cx_filtered - cx_raw) + abs(cy_filtered - cy_raw)
-            if delta > self.snap_thresh:
-                cx_filtered = cx_raw
-                cy_filtered = cy_raw
-                w_filtered = w_raw
-                h_filtered = h_raw
-                self.f_cx.snap(cx_raw)
-                self.f_cy.snap(cy_raw)
-                self.f_w.snap(w_raw)
-                self.f_h.snap(h_raw)
+        if self.snap_enabled and (abs(dx_raw) > self.snap_thresh or abs(dy_raw) > self.snap_thresh):
+            self.f_cx.snap(cx_raw)
+            self.f_cy.snap(cy_raw)
+            cx_filtered = cx_raw
+            cy_filtered = cy_raw
+        else:
+            # Direct position filtering (anchored to raw each frame)
+            cx_filtered = self.f_cx.update(cx_raw, dt)
+            cy_filtered = self.f_cy.update(cy_raw, dt)
 
-        # Return as floats (cx, cy, w, h)
-        return (cx_filtered, cy_filtered, w_filtered, h_filtered)
+        self.prev_cx_raw = cx_raw
+        self.prev_cy_raw = cy_raw
+
+        # --- SCALE HANDLING ---
+        if self.scale_lock_enabled:
+            if frame_idx < self.scale_lock_warmup_frames:
+                self.w_samples.append(w_raw)
+                self.h_samples.append(h_raw)
+                w_final = self.f_w.update(w_raw, dt)
+                h_final = self.f_h.update(h_raw, dt)
+            else:
+                if self.w_locked is None:
+                    self.w_locked = float(np.median(self.w_samples))
+                    self.h_locked = float(np.median(self.h_samples))
+                    print(f"    -> Scale locked: w={self.w_locked:.1f}, h={self.h_locked:.1f}")
+                w_final = self.w_locked
+                h_final = self.h_locked
+        else:
+            w_final = self.f_w.update(w_raw, dt)
+            h_final = self.f_h.update(h_raw, dt)
+
+        return (cx_filtered, cy_filtered, w_final, h_final)
 
     def _clamp_bbox(self, bbox, W, H):
         x1, y1, x2, y2 = bbox
@@ -317,29 +364,51 @@ class RealTimeInference:
             y2 = min(H - 1, y1 + 3)
         return (x1, y1, x2, y2)
 
-    def _build_bg_bboxes_klt_float(self, max_pts=120, min_pts=30):
+    def _build_bg_bboxes_advanced(self, max_pts=120, min_pts=30):
         """
-        Track bbox across bg_frames using KLT optical flow.
-        Returns list of (cx, cy, w, h) as FLOATS to preserve sub-pixel precision.
+        Build bbox track with:
+        1. KLT optical flow for raw tracking
+        2. Direct position filtering (no drift)
+        3. Scale locking after warmup
+        4. Affine transform estimation for micro rotation/scale
         """
         bboxes_float = []
+        affine_transforms = []
         bg_len = len(self.bg_frames)
+
         if bg_len == 0:
-            return bboxes_float
+            return bboxes_float, affine_transforms
 
         H, W = self.bg_frames[0].shape[:2]
 
+        # Initial bbox from coords
         x1, y1, x2, y2 = [float(v) for v in self.input_coords[0]]
+        cx_raw = (x1 + x2) * 0.5
+        cy_raw = (y1 + y2) * 0.5
+        w_raw = x2 - x1
+        h_raw = y2 - y1
 
-        # Store as float (cx, cy, w, h)
-        cx = (x1 + x2) * 0.5
-        cy = (y1 + y2) * 0.5
-        w = x2 - x1
-        h = y2 - y1
+        prev_gray = cv2.cvtColor(self.bg_frames[0], cv2.COLOR_BGR2GRAY)
 
-        prev = cv2.cvtColor(self.bg_frames[0], cv2.COLOR_BGR2GRAY)
+        def init_affine_points(gray, cx, cy, w, h, num_pts):
+            """Initialize tracking points in nose/cheek region (stable texture)"""
+            x1i = max(0, int(cx - w * 0.3))
+            y1i = max(0, int(cy - h * 0.2))
+            x2i = min(W, int(cx + w * 0.3))
+            y2i = min(H, int(cy + h * 0.4))
+            roi = gray[y1i:y2i, x1i:x2i]
+            if roi.size == 0:
+                return None
+            pts = cv2.goodFeaturesToTrack(
+                roi, maxCorners=num_pts, qualityLevel=0.01, minDistance=5, blockSize=7,
+            )
+            if pts is None:
+                return None
+            pts[:, 0, 0] += x1i
+            pts[:, 0, 1] += y1i
+            return pts
 
-        def init_points(gray, cx, cy, w, h):
+        def init_bbox_points(gray, cx, cy, w, h):
             x1i = max(0, int(cx - w * 0.5))
             y1i = max(0, int(cy - h * 0.5))
             x2i = min(W, int(cx + w * 0.5))
@@ -356,8 +425,17 @@ class RealTimeInference:
             pts[:, 0, 1] += y1i
             return pts
 
-        pts = init_points(prev, cx, cy, w, h)
-        bboxes_float.append((cx, cy, w, h))
+        # Initialize tracking points
+        pts_affine = init_affine_points(prev_gray, cx_raw, cy_raw, w_raw, h_raw, self.affine_num_points)
+        pts_bbox = init_bbox_points(prev_gray, cx_raw, cy_raw, w_raw, h_raw)
+
+        # Reset filters
+        self._reset_filters()
+
+        # First frame
+        cx_f, cy_f, w_f, h_f = self._filter_position_direct(cx_raw, cy_raw, w_raw, h_raw, 0)
+        bboxes_float.append((cx_f, cy_f, w_f, h_f))
+        affine_transforms.append(np.eye(2, 3, dtype=np.float32))
 
         lk_params = dict(
             winSize=(21, 21), maxLevel=3,
@@ -365,63 +443,88 @@ class RealTimeInference:
         )
 
         for i in range(1, bg_len):
-            curr = cv2.cvtColor(self.bg_frames[i], cv2.COLOR_BGR2GRAY)
+            curr_gray = cv2.cvtColor(self.bg_frames[i], cv2.COLOR_BGR2GRAY)
 
-            if pts is None or len(pts) < min_pts:
-                pts = init_points(prev, cx, cy, w, h)
+            # --- AFFINE TRANSFORM ESTIMATION ---
+            M_affine = np.eye(2, 3, dtype=np.float32)
 
-            if pts is None:
-                bboxes_float.append((cx, cy, w, h))
-                prev = curr
+            if self.affine_tracking_enabled and pts_affine is not None and len(pts_affine) >= 4:
+                nxt_affine, st_affine, _ = cv2.calcOpticalFlowPyrLK(
+                    prev_gray, curr_gray, pts_affine, None, **lk_params
+                )
+                good_old_affine = pts_affine[st_affine == 1]
+                good_new_affine = nxt_affine[st_affine == 1]
+
+                if len(good_new_affine) >= 4:
+                    M, inliers = cv2.estimateAffinePartial2D(
+                        good_old_affine, good_new_affine, method=cv2.RANSAC
+                    )
+                    if M is not None:
+                        M_affine = M.astype(np.float32)
+                    pts_affine = good_new_affine.reshape(-1, 1, 2)
+                else:
+                    pts_affine = init_affine_points(curr_gray, cx_raw, cy_raw, w_raw, h_raw, self.affine_num_points)
+            else:
+                pts_affine = init_affine_points(curr_gray, cx_raw, cy_raw, w_raw, h_raw, self.affine_num_points)
+
+            affine_transforms.append(M_affine)
+
+            # --- BBOX TRACKING ---
+            if pts_bbox is None or len(pts_bbox) < min_pts:
+                pts_bbox = init_bbox_points(prev_gray, cx_raw, cy_raw, w_raw, h_raw)
+
+            if pts_bbox is None:
+                cx_f, cy_f, w_f, h_f = self._filter_position_direct(cx_raw, cy_raw, w_raw, h_raw, i)
+                bboxes_float.append((cx_f, cy_f, w_f, h_f))
+                prev_gray = curr_gray
                 continue
 
-            nxt, st, err = cv2.calcOpticalFlowPyrLK(prev, curr, pts, None, **lk_params)
-            good_old = pts[st == 1]
-            good_new = nxt[st == 1]
+            nxt_bbox, st_bbox, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, pts_bbox, None, **lk_params)
+            good_old_bbox = pts_bbox[st_bbox == 1]
+            good_new_bbox = nxt_bbox[st_bbox == 1]
 
-            if len(good_new) < min_pts:
-                bboxes_float.append((cx, cy, w, h))
-                prev = curr
-                pts = None
+            if len(good_new_bbox) < min_pts:
+                cx_f, cy_f, w_f, h_f = self._filter_position_direct(cx_raw, cy_raw, w_raw, h_raw, i)
+                bboxes_float.append((cx_f, cy_f, w_f, h_f))
+                prev_gray = curr_gray
+                pts_bbox = None
                 continue
 
-            # Median motion as FLOAT (sub-pixel precision)
-            dx = float(np.median(good_new[:, 0] - good_old[:, 0]))
-            dy = float(np.median(good_new[:, 1] - good_old[:, 1]))
+            # Median motion
+            dx = float(np.median(good_new_bbox[:, 0] - good_old_bbox[:, 0]))
+            dy = float(np.median(good_new_bbox[:, 1] - good_old_bbox[:, 1]))
 
-            # Update center with float precision
-            cx = cx + dx
-            cy = cy + dy
+            # Update raw center
+            cx_raw = cx_raw + dx
+            cy_raw = cy_raw + dy
 
-            # Clamp center to keep bbox in frame
-            cx = max(w * 0.5, min(W - w * 0.5, cx))
-            cy = max(h * 0.5, min(H - h * 0.5, cy))
+            # Clamp to frame bounds
+            cx_raw = max(w_raw * 0.5, min(W - w_raw * 0.5, cx_raw))
+            cy_raw = max(h_raw * 0.5, min(H - h_raw * 0.5, cy_raw))
 
-            bboxes_float.append((cx, cy, w, h))
+            # Apply direct position filtering + scale lock
+            cx_f, cy_f, w_f, h_f = self._filter_position_direct(cx_raw, cy_raw, w_raw, h_raw, i)
+            bboxes_float.append((cx_f, cy_f, w_f, h_f))
 
-            pts = good_new.reshape(-1, 1, 2)
-            prev = curr
+            pts_bbox = good_new_bbox.reshape(-1, 1, 2)
+            prev_gray = curr_gray
 
-        return bboxes_float
+        return bboxes_float, affine_transforms
 
     def _float_bbox_to_int(self, cx, cy, w, h):
         """
-        Convert float (cx, cy, w, h) to int bbox (x1, y1, x2, y2).
-        Returns both int bbox and sub-pixel offsets (dx, dy).
+        Convert float (cx, cy, w, h) to int bbox.
+        Returns both int bbox and sub-pixel offsets.
         """
-        # Float top-left
         fx = cx - w * 0.5
         fy = cy - h * 0.5
 
-        # Integer top-left (for array indexing)
         ix = int(math.floor(fx))
         iy = int(math.floor(fy))
 
-        # Sub-pixel remainder
         dx = fx - ix
         dy = fy - iy
 
-        # Integer bbox
         x1 = ix
         y1 = iy
         x2 = int(round(cx + w * 0.5))
@@ -450,10 +553,51 @@ class RealTimeInference:
         cap.release()
         return frames
 
-    def advanced_blending(self, full_frame, face_img, face_box, mask_img, crop_box, subpixel_offset=(0.0, 0.0)):
+    def _apply_affine_to_patch(self, face_img, mask_img, M_affine, target_size):
         """
-        Advanced blending with feather composite or Poisson blending.
-        Supports sub-pixel alignment to eliminate micro-slip.
+        Apply affine transform for micro rotation/scale compensation.
+        """
+        if not self.affine_tracking_enabled:
+            return face_img, mask_img
+
+        identity = np.eye(2, 3, dtype=np.float32)
+        diff = np.abs(M_affine - identity).max()
+        if diff < 1e-4:
+            return face_img, mask_img
+
+        h, w = face_img.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+
+        a, b = M_affine[0, 0], M_affine[0, 1]
+        c, d = M_affine[1, 0], M_affine[1, 1]
+
+        M_centered = np.float32([
+            [a, b, cx * (1 - a) - cy * b],
+            [c, d, cy * (1 - d) - cx * c]
+        ])
+
+        face_warped = cv2.warpAffine(
+            face_img, M_centered, (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+
+        mask_warped = mask_img
+        if mask_img is not None:
+            mask_warped = cv2.warpAffine(
+                mask_img, M_centered, (w, h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0
+            )
+            mask_warped = (mask_warped > 128).astype(np.uint8) * 255
+
+        return face_warped, mask_warped
+
+    def advanced_blending(self, full_frame, face_img, face_box, mask_img, crop_box,
+                          subpixel_offset=(0.0, 0.0), affine_matrix=None):
+        """
+        Advanced blending with feather/Poisson, sub-pixel alignment, and affine compensation.
         """
         try:
             img_h, img_w = full_frame.shape[:2]
@@ -487,7 +631,13 @@ class RealTimeInference:
             face_offset_y = y - cy_s
             fh, fw = face_img.shape[:2]
 
-            # Apply sub-pixel shift to face and mask BEFORE placement
+            # Apply affine transform
+            if affine_matrix is not None:
+                face_img, mask_img = self._apply_affine_to_patch(
+                    face_img, mask_img, affine_matrix, (fw, fh)
+                )
+
+            # Apply sub-pixel shift
             if self.subpixel_enabled and (abs(dx) > 1e-4 or abs(dy) > 1e-4):
                 face_img = subpixel_shift(face_img, dx, dy)
                 if mask_img is not None:
@@ -575,10 +725,9 @@ class RealTimeInference:
             return None
 
         print(f"    -> Rendering {total_frames} frames...")
-        print(f"    -> Using KLT-tracked bboxes with {self.blend_mode} blending + sub-pixel alignment")
+        print(f"    -> Direct position filtering + scale-lock + affine + {self.blend_mode} blending")
 
         step = max(1, int(round(cache_len / bg_len)))
-        self._reset_bbox_filters()
 
         for i in tqdm(range(total_frames)):
             bg_idx = i % bg_len
@@ -634,9 +783,10 @@ class RealTimeInference:
 
             full_frame = self.bg_frames[bg_idx].copy()
 
-            # Get float bbox and convert to int + sub-pixel offset
+            # Get float bbox and affine transform
             cx, cy, w, h = self.bg_bboxes_float[bg_idx]
             bbox, subpixel_offset = self._float_bbox_to_int(cx, cy, w, h)
+            affine_matrix = self.affine_transforms[bg_idx] if self.affine_tracking_enabled else None
 
             x, y, x1, y1 = bbox
 
@@ -673,7 +823,8 @@ class RealTimeInference:
 
             final_frame = self.advanced_blending(
                 full_frame, face_crop, bbox, mask, mask_crop_box,
-                subpixel_offset=subpixel_offset
+                subpixel_offset=subpixel_offset,
+                affine_matrix=affine_matrix
             )
             video_frames.append(final_frame)
 
