@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="/static/styles.css"/>
+  <script src="/static/app.js"></script>
+  <title>Avatar Chat (Test)</title>
+</head>
+<body>
+  <div class="app">
+    <div class="stage">
+      <video id="avatar" autoplay playsinline muted></video>
+
+      <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+        <div class="loading-text">Rendering response...</div>
+      </div>
+    </div>
+
+    <div class="chat">
+      <div id="log" class="log"></div>
+
+      <form id="form" class="composer">
+        <input id="input" placeholder="Type a message..." autocomplete="off"/>
+        <button type="submit">Send</button>
+      </form>
+    </div>
+  </div>
+
+</body>
+</html>
