@@ -17,6 +17,92 @@ from transformers import WhisperModel
 
 
 # ==========================================
+# BLENDING HELPER FUNCTIONS
+# ==========================================
+def feather_composite(bg_roi, gen_roi, mask_255):
+    """
+    Feathered boundary blending using OpenCV morphology.
+    Hard replace inside, feather only at the boundary.
+    bg_roi, gen_roi: HxWx3 uint8
+    mask_255: HxW uint8 (0 or 255)
+    """
+    m = (mask_255 > 0).astype(np.uint8) * 255
+
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+
+    inner = cv2.erode(m, k3, iterations=1)
+    outer = cv2.dilate(m, k9, iterations=1)
+    feather = cv2.GaussianBlur(outer, (0, 0), 2.0)
+    feather = feather.astype(np.float32) / 255.0
+    inner_f = inner.astype(np.float32) / 255.0
+
+    boundary = np.clip(feather - inner_f, 0.0, 1.0)
+
+    out = bg_roi.copy().astype(np.float32)
+    gen = gen_roi.astype(np.float32)
+
+    out = out * (1 - inner_f[..., None]) + gen * inner_f[..., None]
+    out = out * (1 - boundary[..., None]) + gen * boundary[..., None]
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def poisson_blend(bg_roi, gen_roi, mask_255):
+    """
+    Poisson (seamless) blending for strongest seam fix.
+    """
+    if mask_255.sum() < 100:
+        return bg_roi
+
+    h, w = bg_roi.shape[:2]
+    center = (w // 2, h // 2)
+
+    try:
+        blended = cv2.seamlessClone(gen_roi, bg_roi, mask_255, center, cv2.NORMAL_CLONE)
+        return blended
+    except Exception:
+        return feather_composite(bg_roi, gen_roi, mask_255)
+
+
+def subpixel_shift(img, dx, dy):
+    """
+    Apply sub-pixel translation using warpAffine.
+    dx, dy: fractional pixel offsets (e.g., 0.3, -0.7)
+    """
+    if abs(dx) < 1e-4 and abs(dy) < 1e-4:
+        return img
+
+    h, w = img.shape[:2]
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    shifted = cv2.warpAffine(
+        img, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+    return shifted
+
+
+def subpixel_shift_mask(mask, dx, dy):
+    """
+    Apply sub-pixel translation to mask, then re-binarize.
+    """
+    if abs(dx) < 1e-4 and abs(dy) < 1e-4:
+        return mask
+
+    h, w = mask.shape[:2]
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    shifted = cv2.warpAffine(
+        mask, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0
+    )
+    # Re-binarize (threshold at 128 to avoid soft edges from interpolation)
+    return (shifted > 128).astype(np.uint8) * 255
+
+
+# ==========================================
 # ONE-EURO FILTER CLASSES
 # ==========================================
 def _alpha(cutoff, dt):
@@ -43,13 +129,6 @@ class LowPass:
 
 
 class OneEuro:
-    """
-    One Euro filter for a scalar.
-    Typical tuning:
-      min_cutoff ~ 1.0 to 2.0
-      beta       ~ 0.03 to 0.20
-      d_cutoff   ~ 1.0
-    """
     def __init__(self, min_cutoff=1.5, beta=0.08, d_cutoff=1.0):
         self.min_cutoff = float(min_cutoff)
         self.beta = float(beta)
@@ -75,13 +154,11 @@ class OneEuro:
         return x_hat
 
     def reset(self):
-        """Reset filter state for new sequence"""
         self.x_f.reset()
         self.dx_f.reset()
         self.last_x = None
 
     def snap(self, x):
-        """Force filter to snap to a new value (bypass smoothing)"""
         x = float(x)
         self.x_f.inited = True
         self.x_f.y = x
@@ -98,23 +175,23 @@ class RealTimeInference:
         # ==========================================
         # 🔧 TUNING PARAMETERS
         # ==========================================
-        self.sync_offset = 0    # Latency adjustment
-        self.nose_crop = 0.7    # Safe zone for nose
-        self.video_fps = 25     # Output FPS for One-Euro filter dt calculation
+        self.sync_offset = 0
+        self.nose_crop = 0.7
+        self.video_fps = 25
 
-        # One-Euro Filter Tuning:
-        # - If still jittery: increase min_cutoff (e.g., 2.0) or lower beta
-        # - If lagging on head turns: increase beta (e.g., 0.15–0.25)
-        self.filter_min_cutoff_pos = 1.5   # For cx, cy (position)
+        self.filter_min_cutoff_pos = 1.5
         self.filter_beta_pos = 0.10
-        self.filter_min_cutoff_size = 1.0  # For w, h (size)
+        self.filter_min_cutoff_size = 1.0
         self.filter_beta_size = 0.08
 
-        # Snap Gating Tuning:
-        # - Higher threshold = less snapping, smoother but may lag
-        # - Lower threshold = more snapping, responsive but may jitter
-        self.snap_thresh = 12  # pixels - bypass smoothing if delta exceeds this
+        self.snap_thresh = 12
         self.snap_enabled = True
+
+        # Blending Mode: 'feather' or 'poisson'
+        self.blend_mode = 'feather'
+
+        # Sub-pixel alignment: eliminates 1px "micro slip" from float→int rounding
+        self.subpixel_enabled = True
         # ==========================================
 
         # --- PATHS ---
@@ -124,12 +201,10 @@ class RealTimeInference:
         self.mask_coords_path = os.path.join(self.cache_dir, "mask_coords.pkl")
         self.mask_out_path = os.path.join(self.cache_dir, "mask")
 
-        # 1. Load Background Video
         self.video_path = config.get("video_path", "data/video/bank_avatar_hd.mp4")
         print(f"    -> Loading Background Frames from {self.video_path}...")
         self.bg_frames = self.read_video(self.video_path)
 
-        # 2. Load Models (Standard loading...)
         print("    -> Loading VAE, UNet, and PE...")
         loaded_models = load_all_model()
         if len(loaded_models) == 4:
@@ -148,7 +223,6 @@ class RealTimeInference:
             try: model.to(self.device)
             except: pass
 
-        # Detect Precision
         try: self.model_dtype = next(self.unet_model.parameters()).dtype
         except: self.model_dtype = torch.float16
 
@@ -156,13 +230,11 @@ class RealTimeInference:
         if hasattr(self.vae, "vae"): self.vae.vae = self.vae.vae.to(dtype=self.model_dtype)
         elif hasattr(self.vae, "to"): self.vae = self.vae.to(dtype=self.model_dtype)
 
-        # 3. Initialize Audio Processor
         print("    -> Loading Whisper Audio Processor...")
         self.whisper_dir = "./models/whisper/"
         self.audio_processor = AudioProcessor(feature_extractor_path=self.whisper_dir)
         self.whisper_model = WhisperModel.from_pretrained(self.whisper_dir).to(self.device, dtype=self.model_dtype).eval()
 
-        # 4. Load Cache
         print("    -> Loading Cache Files...")
         raw_loaded = torch.load(self.latents_path)
         if isinstance(raw_loaded, list):
@@ -180,78 +252,60 @@ class RealTimeInference:
         input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         self.mask_list = read_imgs(input_mask_list)
 
-        # 5. Initialize One-Euro Filters for bbox smoothing
         print("    -> Initializing One-Euro filters with snap gating...")
         self._init_bbox_filters()
 
-        # 6. Build background bbox track using KLT optical flow
         print("    -> Building background bbox track (KLT)...")
-        self.bg_bboxes = self._build_bg_bboxes_klt()
-        print(f"    -> Built {len(self.bg_bboxes)} bg bboxes")
+        self.bg_bboxes_float = self._build_bg_bboxes_klt_float()
+        print(f"    -> Built {len(self.bg_bboxes_float)} bg bboxes (float precision)")
 
         print(f"✅ Avatar '{self.avatar_id}' loaded with {len(self.mask_list)} masks!")
 
     def _init_bbox_filters(self):
-        """Initialize One-Euro filters for bounding box coordinates"""
         self.f_cx = OneEuro(min_cutoff=self.filter_min_cutoff_pos, beta=self.filter_beta_pos)
         self.f_cy = OneEuro(min_cutoff=self.filter_min_cutoff_pos, beta=self.filter_beta_pos)
         self.f_w = OneEuro(min_cutoff=self.filter_min_cutoff_size, beta=self.filter_beta_size)
         self.f_h = OneEuro(min_cutoff=self.filter_min_cutoff_size, beta=self.filter_beta_size)
 
     def _reset_bbox_filters(self):
-        """Reset filters for a new rendering session"""
         self.f_cx.reset()
         self.f_cy.reset()
         self.f_w.reset()
         self.f_h.reset()
 
-    def _filter_bbox_with_snap(self, x1, y1, x2, y2):
+    def _filter_bbox_with_snap_float(self, x1, y1, x2, y2):
         """
         Apply One-Euro filter to bounding box with snap gating.
-        Snap gating bypasses smoothing when movement exceeds threshold (fast head turns).
+        Returns FLOAT (cx, cy, w, h) to preserve sub-pixel precision.
         """
         dt = 1.0 / self.video_fps
 
-        # Convert raw bbox to center + size
         cx_raw = (x1 + x2) * 0.5
         cy_raw = (y1 + y2) * 0.5
-        w_raw = (x2 - x1)
-        h_raw = (y2 - y1)
+        w_raw = float(x2 - x1)
+        h_raw = float(y2 - y1)
 
-        # Apply One-Euro filter
         cx_filtered = self.f_cx.update(cx_raw, dt)
         cy_filtered = self.f_cy.update(cy_raw, dt)
         w_filtered = self.f_w.update(w_raw, dt)
         h_filtered = self.f_h.update(h_raw, dt)
 
-        # --- SNAP GATING ---
-        # If the raw position moved too far from filtered, snap to raw (fast head turn)
         if self.snap_enabled:
             delta = abs(cx_filtered - cx_raw) + abs(cy_filtered - cy_raw)
-
             if delta > self.snap_thresh:
-                # Bypass smoothing - snap to raw values
                 cx_filtered = cx_raw
                 cy_filtered = cy_raw
                 w_filtered = w_raw
                 h_filtered = h_raw
-
-                # Reset filters to the snapped position to avoid oscillation
                 self.f_cx.snap(cx_raw)
                 self.f_cy.snap(cy_raw)
                 self.f_w.snap(w_raw)
                 self.f_h.snap(h_raw)
 
-        # Convert back to corner format (PATCH A: use round())
-        x1f = int(round(cx_filtered - w_filtered * 0.5))
-        y1f = int(round(cy_filtered - h_filtered * 0.5))
-        x2f = int(round(cx_filtered + w_filtered * 0.5))
-        y2f = int(round(cy_filtered + h_filtered * 0.5))
-
-        return (x1f, y1f, x2f, y2f)
+        # Return as floats (cx, cy, w, h)
+        return (cx_filtered, cy_filtered, w_filtered, h_filtered)
 
     def _clamp_bbox(self, bbox, W, H):
-        """Clamp bbox to image bounds and ensure minimum size."""
         x1, y1, x2, y2 = bbox
         x1 = max(0, min(W - 1, x1))
         y1 = max(0, min(H - 1, y1))
@@ -263,49 +317,50 @@ class RealTimeInference:
             y2 = min(H - 1, y1 + 3)
         return (x1, y1, x2, y2)
 
-    def _build_bg_bboxes_klt(self, max_pts=120, min_pts=30):
+    def _build_bg_bboxes_klt_float(self, max_pts=120, min_pts=30):
         """
         Track bbox across bg_frames using KLT optical flow.
-        Returns list of bboxes (len == bg_len) in bg frame coordinates.
+        Returns list of (cx, cy, w, h) as FLOATS to preserve sub-pixel precision.
         """
-        bboxes = []
+        bboxes_float = []
         bg_len = len(self.bg_frames)
         if bg_len == 0:
-            return bboxes
+            return bboxes_float
 
         H, W = self.bg_frames[0].shape[:2]
 
-        # Start bbox from coords that correspond to bg frame 0 time.
-        # (Assumes avatar was built from the SAME bg video. If not, rebuild avatar cache.)
-        x1, y1, x2, y2 = [int(v) for v in self.input_coords[0]]
-        bbox = self._clamp_bbox((x1, y1, x2, y2), W, H)
+        x1, y1, x2, y2 = [float(v) for v in self.input_coords[0]]
+
+        # Store as float (cx, cy, w, h)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        w = x2 - x1
+        h = y2 - y1
 
         prev = cv2.cvtColor(self.bg_frames[0], cv2.COLOR_BGR2GRAY)
 
-        def init_points(gray, bb):
-            x1, y1, x2, y2 = bb
-            roi = gray[y1:y2, x1:x2]
+        def init_points(gray, cx, cy, w, h):
+            x1i = max(0, int(cx - w * 0.5))
+            y1i = max(0, int(cy - h * 0.5))
+            x2i = min(W, int(cx + w * 0.5))
+            y2i = min(H, int(cy + h * 0.5))
+            roi = gray[y1i:y2i, x1i:x2i]
             if roi.size == 0:
                 return None
             pts = cv2.goodFeaturesToTrack(
-                roi,
-                maxCorners=max_pts,
-                qualityLevel=0.01,
-                minDistance=6,
-                blockSize=7,
+                roi, maxCorners=max_pts, qualityLevel=0.01, minDistance=6, blockSize=7,
             )
             if pts is None:
                 return None
-            pts[:, 0, 0] += x1
-            pts[:, 0, 1] += y1
+            pts[:, 0, 0] += x1i
+            pts[:, 0, 1] += y1i
             return pts
 
-        pts = init_points(prev, bbox)
-        bboxes.append(bbox)
+        pts = init_points(prev, cx, cy, w, h)
+        bboxes_float.append((cx, cy, w, h))
 
         lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
+            winSize=(21, 21), maxLevel=3,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
         )
 
@@ -313,11 +368,10 @@ class RealTimeInference:
             curr = cv2.cvtColor(self.bg_frames[i], cv2.COLOR_BGR2GRAY)
 
             if pts is None or len(pts) < min_pts:
-                pts = init_points(prev, bbox)
+                pts = init_points(prev, cx, cy, w, h)
 
             if pts is None:
-                # fallback: keep last bbox
-                bboxes.append(bbox)
+                bboxes_float.append((cx, cy, w, h))
                 prev = curr
                 continue
 
@@ -326,38 +380,60 @@ class RealTimeInference:
             good_new = nxt[st == 1]
 
             if len(good_new) < min_pts:
-                bboxes.append(bbox)
+                bboxes_float.append((cx, cy, w, h))
                 prev = curr
                 pts = None
                 continue
 
-            # Median motion is robust to outliers
-            dx = np.median(good_new[:, 0] - good_old[:, 0])
-            dy = np.median(good_new[:, 1] - good_old[:, 1])
+            # Median motion as FLOAT (sub-pixel precision)
+            dx = float(np.median(good_new[:, 0] - good_old[:, 0]))
+            dy = float(np.median(good_new[:, 1] - good_old[:, 1]))
 
-            # Shift bbox by median motion
-            x1, y1, x2, y2 = bbox
-            x1_new = int(round(x1 + dx))
-            y1_new = int(round(y1 + dy))
-            x2_new = int(round(x2 + dx))
-            y2_new = int(round(y2 + dy))
+            # Update center with float precision
+            cx = cx + dx
+            cy = cy + dy
 
-            bbox = self._clamp_bbox((x1_new, y1_new, x2_new, y2_new), W, H)
-            bboxes.append(bbox)
+            # Clamp center to keep bbox in frame
+            cx = max(w * 0.5, min(W - w * 0.5, cx))
+            cy = max(h * 0.5, min(H - h * 0.5, cy))
 
-            # Update points for next iteration
+            bboxes_float.append((cx, cy, w, h))
+
             pts = good_new.reshape(-1, 1, 2)
             prev = curr
 
-        return bboxes
+        return bboxes_float
 
-    # PATCH B: Helper to derive crop box from filtered bbox
+    def _float_bbox_to_int(self, cx, cy, w, h):
+        """
+        Convert float (cx, cy, w, h) to int bbox (x1, y1, x2, y2).
+        Returns both int bbox and sub-pixel offsets (dx, dy).
+        """
+        # Float top-left
+        fx = cx - w * 0.5
+        fy = cy - h * 0.5
+
+        # Integer top-left (for array indexing)
+        ix = int(math.floor(fx))
+        iy = int(math.floor(fy))
+
+        # Sub-pixel remainder
+        dx = fx - ix
+        dy = fy - iy
+
+        # Integer bbox
+        x1 = ix
+        y1 = iy
+        x2 = int(round(cx + w * 0.5))
+        y2 = int(round(cy + h * 0.5))
+
+        return (x1, y1, x2, y2), (dx, dy)
+
     def _crop_box_from_bbox(self, bbox, pad_ratio=0.45):
-        """Derive crop box from filtered bbox to ensure alignment."""
         x1, y1, x2, y2 = bbox
         w = x2 - x1
         h = y2 - y1
-        pad = int(round(max(w, h) * pad_ratio))  # context margin
+        pad = int(round(max(w, h) * pad_ratio))
         return (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
 
     def read_video(self, path):
@@ -374,70 +450,104 @@ class RealTimeInference:
         cap.release()
         return frames
 
-    def safe_blending(self, full_frame, face_img, face_box, mask_img, crop_box):
+    def advanced_blending(self, full_frame, face_img, face_box, mask_img, crop_box, subpixel_offset=(0.0, 0.0)):
         """
-        A robust blending function that handles edge-of-screen cases explicitly.
+        Advanced blending with feather composite or Poisson blending.
+        Supports sub-pixel alignment to eliminate micro-slip.
         """
         try:
-            # Convert to PIL
-            body = Image.fromarray(full_frame[:, :, ::-1])  # BGR to RGB
-            face = Image.fromarray(face_img[:, :, ::-1])
-            if mask_img is not None:
-                mask = Image.fromarray(mask_img).convert("L")
-            else:
-                # Create a default white mask if none provided
-                mask = Image.new("L", face.size, 255)
-
-            # Dimensions
-            img_w, img_h = body.size
+            img_h, img_w = full_frame.shape[:2]
             x, y, x1, y1 = face_box
-            cx_s, cy_s, cx_e, cy_e = crop_box  # The larger box used for blending context
+            cx_s, cy_s, cx_e, cy_e = crop_box
+            dx, dy = subpixel_offset
 
-            # 1. Calculate the 'Safe' Crop Box (clamped to image bounds)
+            if x1 <= x or y1 <= y:
+                return full_frame
+
             safe_cx_s = max(0, cx_s)
             safe_cy_s = max(0, cy_s)
             safe_cx_e = min(img_w, cx_e)
             safe_cy_e = min(img_h, cy_e)
 
-            # If the safe box is invalid (e.g. fully off screen), return original
             if safe_cx_e <= safe_cx_s or safe_cy_e <= safe_cy_s:
                 return full_frame
 
-            # 2. Crop the Background (Safe area only)
-            bg_crop = body.crop((safe_cx_s, safe_cy_s, safe_cx_e, safe_cy_e))
-            bg_w, bg_h = bg_crop.size
+            bg_roi = full_frame[safe_cy_s:safe_cy_e, safe_cx_s:safe_cx_e].copy()
 
-            # 3. Build a canvas for crop_box, then crop it down to safe area
             crop_w = cx_e - cx_s
             crop_h = cy_e - cy_s
 
-            # Canvas for Face
-            face_canvas = Image.new("RGB", (crop_w, crop_h), (0, 0, 0))
+            face_canvas = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
+            rel_x_bg = safe_cx_s - cx_s
+            rel_y_bg = safe_cy_s - cy_s
+            face_canvas[rel_y_bg:rel_y_bg + bg_roi.shape[0],
+                        rel_x_bg:rel_x_bg + bg_roi.shape[1]] = bg_roi.copy()
+
             face_offset_x = x - cx_s
             face_offset_y = y - cy_s
-            face_canvas.paste(face, (face_offset_x, face_offset_y))
+            fh, fw = face_img.shape[:2]
 
-            # Canvas for Mask
-            mask_canvas = Image.new("L", (crop_w, crop_h), 0)
-            mask_canvas.paste(mask, (face_offset_x, face_offset_y))
+            # Apply sub-pixel shift to face and mask BEFORE placement
+            if self.subpixel_enabled and (abs(dx) > 1e-4 or abs(dy) > 1e-4):
+                face_img = subpixel_shift(face_img, dx, dy)
+                if mask_img is not None:
+                    mask_img = subpixel_shift_mask(mask_img, dx, dy)
 
-            # 4. Crop the canvases to match the safe background crop
+            fx_start = max(0, face_offset_x)
+            fy_start = max(0, face_offset_y)
+            fx_end = min(crop_w, face_offset_x + fw)
+            fy_end = min(crop_h, face_offset_y + fh)
+
+            src_x_start = fx_start - face_offset_x
+            src_y_start = fy_start - face_offset_y
+            src_x_end = src_x_start + (fx_end - fx_start)
+            src_y_end = src_y_start + (fy_end - fy_start)
+
+            if fx_end > fx_start and fy_end > fy_start:
+                face_canvas[fy_start:fy_end, fx_start:fx_end] = \
+                    face_img[src_y_start:src_y_end, src_x_start:src_x_end]
+
+            mask_canvas = np.zeros((crop_h, crop_w), dtype=np.uint8)
+            if mask_img is not None:
+                if mask_img.ndim == 3:
+                    mask_img = mask_img[:, :, 0]
+                mh, mw = mask_img.shape[:2]
+
+                mx_start = max(0, face_offset_x)
+                my_start = max(0, face_offset_y)
+                mx_end = min(crop_w, face_offset_x + mw)
+                my_end = min(crop_h, face_offset_y + mh)
+
+                msrc_x_start = mx_start - face_offset_x
+                msrc_y_start = my_start - face_offset_y
+                msrc_x_end = msrc_x_start + (mx_end - mx_start)
+                msrc_y_end = msrc_y_start + (my_end - my_start)
+
+                if mx_end > mx_start and my_end > my_start:
+                    mask_canvas[my_start:my_end, mx_start:mx_end] = \
+                        mask_img[msrc_y_start:msrc_y_end, msrc_x_start:msrc_x_end]
+
             rel_x = safe_cx_s - cx_s
             rel_y = safe_cy_s - cy_s
+            bg_h, bg_w = bg_roi.shape[:2]
 
-            face_patch = face_canvas.crop((rel_x, rel_y, rel_x + bg_w, rel_y + bg_h))
-            mask_patch = mask_canvas.crop((rel_x, rel_y, rel_x + bg_w, rel_y + bg_h))
+            gen_roi = face_canvas[rel_y:rel_y + bg_h, rel_x:rel_x + bg_w]
+            mask_roi = mask_canvas[rel_y:rel_y + bg_h, rel_x:rel_x + bg_w]
 
-            # 5. Paste safely
-            bg_crop.paste(face_patch, (0, 0), mask_patch)
+            mask_255 = (mask_roi > 0).astype(np.uint8) * 255
 
-            # 6. Put the patch back into the main image
-            body.paste(bg_crop, (safe_cx_s, safe_cy_s))
+            if self.blend_mode == 'poisson':
+                blended_roi = poisson_blend(bg_roi, gen_roi, mask_255)
+            else:
+                blended_roi = feather_composite(bg_roi, gen_roi, mask_255)
 
-            return np.array(body)[:, :, ::-1]  # RGB to BGR
+            result = full_frame.copy()
+            result[safe_cy_s:safe_cy_e, safe_cx_s:safe_cx_e] = blended_roi
+
+            return result
 
         except Exception as e:
-            print(f"⚠️ Safe Blending Failed: {e}")
+            print(f"⚠️ Advanced Blending Failed: {e}")
             return full_frame
 
     @torch.no_grad()
@@ -465,28 +575,20 @@ class RealTimeInference:
             return None
 
         print(f"    -> Rendering {total_frames} frames...")
-        print(f"    -> Using KLT-tracked bboxes for stable blending")
+        print(f"    -> Using KLT-tracked bboxes with {self.blend_mode} blending + sub-pixel alignment")
 
-        # FIX 1: SPEED SYNC (Ratio Calculation)
         step = max(1, int(round(cache_len / bg_len)))
-
-        # Reset One-Euro filters for this new rendering session (kept for optional use)
         self._reset_bbox_filters()
 
         for i in tqdm(range(total_frames)):
-            # 1. Master Clock: Background Video Loop (25fps)
             bg_idx = i % bg_len
-
-            # 2. Slave Clock: Cache Index (50fps)
             frame_idx = (bg_idx * step) + self.sync_offset
 
-            # 3. Handle Looping / Boundary Safety
             if frame_idx < 0:
                 frame_idx = cache_len + frame_idx
             if frame_idx >= cache_len:
                 frame_idx = frame_idx % cache_len
 
-            # --- PREPARE LATENTS ---
             raw_latent = self.input_latents[frame_idx]
             if raw_latent.dim() == 3:
                 raw_latent = raw_latent.unsqueeze(0)
@@ -496,7 +598,6 @@ class RealTimeInference:
             else:
                 ref_latent = raw_latent
 
-            # --- MASKING ---
             if hasattr(self.vae, "vae"):
                 pixel_img = self.vae.vae.decode(ref_latent / 0.18215).sample
             else:
@@ -513,7 +614,6 @@ class RealTimeInference:
             masked_latent = masked_latent * 0.18215
             unet_input = torch.cat([masked_latent, ref_latent], dim=1)
 
-            # --- RUN MODEL ---
             audio_in = whisper_chunks[i].unsqueeze(0)
             audio_with_pe = self.pe(audio_in)
 
@@ -523,7 +623,6 @@ class RealTimeInference:
                 encoder_hidden_states=audio_with_pe,
             ).sample
 
-            # --- DECODE ---
             if hasattr(self.vae, "vae"):
                 recon_image = self.vae.vae.decode(pred_latent / 0.18215).sample
             else:
@@ -533,65 +632,51 @@ class RealTimeInference:
             face_crop = face_crop.cpu().numpy().astype(np.uint8)
             face_crop = cv2.cvtColor(face_crop, cv2.COLOR_RGB2BGR)
 
-            # --- BLENDING ---
             full_frame = self.bg_frames[bg_idx].copy()
 
-            # KLT FIX: Use pre-tracked bbox from background video
-            bbox = self.bg_bboxes[bg_idx]
-            # Optional: apply additional filtering (usually not needed if KLT is stable)
-            # bbox = self._filter_bbox_with_snap(*bbox)
+            # Get float bbox and convert to int + sub-pixel offset
+            cx, cy, w, h = self.bg_bboxes_float[bg_idx]
+            bbox, subpixel_offset = self._float_bbox_to_int(cx, cy, w, h)
 
             x, y, x1, y1 = bbox
 
             mask = self.mask_list[frame_idx]
-
-            # PATCH B: Derive crop box from filtered bbox (guarantees alignment)
             mask_crop_box = self._crop_box_from_bbox(bbox, pad_ratio=0.45)
 
-            # --- FIX 3: RESIZE TO FIT (Dimension Mismatch) ---
             target_w = x1 - x
             target_h = y1 - y
 
-            # Ensure positive dimensions
             if target_w <= 0 or target_h <= 0:
                 video_frames.append(full_frame)
                 continue
 
-            # Resize Face
             if face_crop.shape[0] != target_h or face_crop.shape[1] != target_w:
                 try:
                     face_crop = cv2.resize(face_crop, (target_w, target_h))
                 except Exception:
                     pass
 
-            # PATCH C: Proper mask handling (INTER_NEAREST + binarize)
             if mask is not None:
-                # If mask is 3-channel, take one channel
                 if mask.ndim == 3:
                     mask = mask[:, :, 0]
 
-                # Resize with NEAREST to avoid gray alpha edges
                 if mask.shape[0] != target_h or mask.shape[1] != target_w:
                     try:
                         mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
                     except Exception:
                         pass
 
-                # Binarize to 0/255 (critical to prevent blending two mouths)
                 mask = (mask > 0).astype(np.uint8) * 255
 
-                # Nose crop (stays binary)
                 top_boundary = int(mask.shape[0] * self.nose_crop)
                 mask[:top_boundary, :] = 0
 
-                # Zero face pixels based on mask (mask is now guaranteed 2D)
-                face_crop[mask == 0] = 0
-
-            # D. Call Safe Blending
-            final_frame = self.safe_blending(full_frame, face_crop, bbox, mask, mask_crop_box)
+            final_frame = self.advanced_blending(
+                full_frame, face_crop, bbox, mask, mask_crop_box,
+                subpixel_offset=subpixel_offset
+            )
             video_frames.append(final_frame)
 
-        # Save & Merge Audio
         temp_video = output_video_path.replace(".mp4", "_silent.mp4")
         if len(video_frames) > 0:
             h, w, _ = video_frames[0].shape
