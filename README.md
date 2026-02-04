@@ -89,6 +89,8 @@ In standard inference scripts (like the original `inference.py`), the lifecycle 
 
 For a 100-frame video (4 seconds), steps 3 and 4 alone add 15 seconds of latency on a mid-range GPU.
 
+Also, when it first render AI generated mouth on top of the video uploaded, the rendering will take up to 10 mins on a low range GPU. But after rendering, we are able to 
+
 ### The "Warm Server" Solution
 
 The **Warm Server** (`server_fast.py` + `warm_api.py`) changes the lifecycle to:
@@ -144,11 +146,11 @@ To simulate a real video call, we cannot just return "video_1.mp4", then "video_
 ```bash
 # Clone the repository
 git clone https://github.com/TMElyralab/MuseTalk.git
-cd MuseTalk
+cd MuseTalk/MuseTalk
 
-# Create Conda Environment
-conda create -n musetalk python=3.10
-conda activate musetalk
+# create and activate environment
+python3 venv venv
+source venv/bin/activate
 
 # Install PyTorch (Ensure CUDA compatibility)
 pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
@@ -158,6 +160,7 @@ pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https
 ### Step 2: Install Core Dependencies
 
 Use the provided `requirements.txt`.
+
 
 ```bash
 pip install -r requirements.txt
@@ -178,7 +181,7 @@ pip install gfpgan basicsr
 
 ### Step 3: Model Weight Acquisition
 
-You must organize your `models/` directory exactly as follows. Use the `download_weights.sh` script if on Linux, or manually place files for Windows.
+You must organize your `models/` directory exactly as follows. Use the `download_weights.sh` script if on Linux, or manually place files for Windows. (Ask AI for this since the dependencies are usually changed frequently)
 
 **Directory Structure:**
 
@@ -219,7 +222,7 @@ The script `scripts/force_prep.py` performs the following atomic operations:
 ### Execution Guide
 
 1. **Prepare Source Video:** Place your high-quality avatar video (e.g., `avatar_1.mp4`) in `data/video/`.
-2. **Edit Config:** Open `scripts/force_prep.py`.
+3. **Edit Config:** Open `scripts/force_prep.py`.
 ```python
 AVATAR_ID = "my_avatar_v1"
 VIDEO_PATH = "data/video/avatar_1.mp4"
@@ -237,7 +240,107 @@ python -m scripts.force_prep
 
 *Result:* A new folder `results/avatars/my_avatar_v1/` is created containing `latents.pt`, `coords.pkl`, etc.
 
----
+------------------------
+
+However, after this, you may notice you are encountering this error:
+
+
+no file path: ./models/dwpose/dw-ll_ucoco_384.pth
+
+this is because you haven't downloaded the weight of the open sourced model. the way to fix it is to paste this into terminal:
+
+------------------------------------------------------------------------
+python -c '
+import os
+from huggingface_hub import hf_hub_download
+
+# Define the weights to download
+downloads = [
+    ("TMElyralab/MuseTalk", "musetalk/musetalk.json", "models/musetalk"),
+    ("TMElyralab/MuseTalk", "musetalk/pytorch_model.bin", "models/musetalk"),
+    ("TMElyralab/MuseTalk", "musetalkV15/musetalk.json", "models/musetalkV15"),
+    ("TMElyralab/MuseTalk", "musetalkV15/unet.pth", "models/musetalkV15"),
+    ("stabilityai/sd-vae-ft-mse", "config.json", "models/sd-vae"),
+    ("stabilityai/sd-vae-ft-mse", "diffusion_pytorch_model.bin", "models/sd-vae"),
+    ("openai/whisper-tiny", "config.json", "models/whisper"),
+    ("openai/whisper-tiny", "pytorch_model.bin", "models/whisper"),
+    ("openai/whisper-tiny", "preprocessor_config.json", "models/whisper"),
+    ("yzd-v/DWPose", "dw-ll_ucoco_384.pth", "models/dwpose"),
+    ("ByteDance/LatentSync", "latentsync_syncnet.pt", "models/syncnet")
+]
+
+print("Starting download...")
+for repo, filename, local_dir in downloads:
+    print(f"Downloading {filename}...")
+    os.makedirs(local_dir, exist_ok=True)
+    hf_hub_download(repo_id=repo, filename=filename, local_dir=local_dir)
+
+# Download ResNet manually (not on HF Hub)
+import urllib.request
+print("Downloading resnet18...")
+os.makedirs("models/face-parse-bisent", exist_ok=True)
+urllib.request.urlretrieve(
+    "https://download.pytorch.org/models/resnet18-5c106cde.pth", 
+    "models/face-parse-bisent/resnet18-5c106cde.pth"
+)
+print("All downloads complete.")
+'
+---------------------------------------------------------------------------
+
+If this still returns some other errors
+<img width="934" height="338" alt="Screenshot 2026-02-04 at 4 44 48 pm" src="https://github.com/user-attachments/assets/cb7677b2-bee6-4fd1-9ed9-18c0759e5d2f" />
+
+apply this:
+
+---------------------------------------------------------------------------
+
+python -c '
+import os
+import shutil
+from huggingface_hub import hf_hub_download
+
+def fix_or_download(repo, filename, expected_path, correct_local_dir_arg):
+    # 1. Check if file exists in the "wrong" nested location
+    # Previous script likely made: models/musetalkV15/musetalkV15/unet.pth
+    nested_path = os.path.join(os.path.dirname(expected_path), filename)
+    
+    if os.path.exists(nested_path):
+        print(f"Found nested file at {nested_path}. Moving to {expected_path}...")
+        os.rename(nested_path, expected_path)
+        # Try to remove empty nested dir
+        try:
+            os.rmdir(os.path.dirname(nested_path))
+        except:
+            pass
+    elif os.path.exists(expected_path):
+        print(f"✅ File already exists at {expected_path}")
+    else:
+        print(f"File missing. Downloading {filename} to {expected_path}...")
+        # To get models/musetalkV15/unet.pth, we set local_dir="models" 
+        # because filename already contains "musetalkV15/"
+        hf_hub_download(repo_id=repo, filename=filename, local_dir=correct_local_dir_arg)
+
+# Fix V1.5 UNet
+fix_or_download(
+    "TMElyralab/MuseTalk", 
+    "musetalkV15/unet.pth", 
+    "models/musetalkV15/unet.pth",
+    "models" 
+)
+
+# Fix V1.5 Config
+fix_or_download(
+    "TMElyralab/MuseTalk", 
+    "musetalkV15/musetalk.json", 
+    "models/musetalkV15/musetalk.json",
+    "models"
+)
+
+print("Fix complete. Running prep...")
+'
+------------------------------------------------------------------------------------
+
+
 
 ## 6. Phase 2: High-Fidelity Enhancement
 
@@ -272,9 +375,15 @@ python enhance.py
 
 *Note:* The script extracts frames to a `temp_frames` directory, applies `restorer.enhance()`, and then restitches them using FFmpeg to preserve the audio sync.
 
+Before:
+<img width="504" height="760" alt="Screenshot 2026-02-04 at 4 46 32 pm" src="https://github.com/user-attachments/assets/bcc47610-78dd-4953-9d42-ff95bb14b478" />
+
+After:
+<img width="539" height="950" alt="Screenshot 2026-02-04 at 4 45 33 pm" src="https://github.com/user-attachments/assets/3bdfa7b4-1104-4597-a030-cdf7269415f1" />
+
 ---
 
-## 7. Phase 3: The Warm Server (Runtime)
+## 7. Phase 3: The Warm Server (Runtime) (the main file to keep the render stable and effective) IMPORTANT
 
 This is the core of the project. The `server_fast.py` script initializes the `warm_api.py` engine.
 
@@ -302,6 +411,8 @@ The **One-Euro Filter** (implemented in `OneEuro` class) is a low-pass filter th
 To handle head rotation (roll), the API uses `cv2.calcOpticalFlowPyrLK` (Lucas-Kanade) to track stable features (nose bridge, eyes).
 It computes an **Affine Matrix** (`M_affine`) representing the rotation difference between the current frame and the reference. This matrix is applied to the generated mouth patch *before* pasting, ensuring the mouth rotates perfectly with the head.
 
+You can add more features and algorithms in to help with the rendering stability. 
+
 ### API Endpoints (`server_fast.py`)
 
 * **`POST /speak`**
@@ -323,7 +434,7 @@ It computes an **Affine Matrix** (`M_affine`) representing the rotation differen
 
 ---
 
-## 8. Phase 4: The Full-Stack Web Application
+## 8. Phase 4: The Full-Stack Web Application (still need to work on, especially the frontend)
 
 Located in `webapp/`, this is a fully functional chat interface.
 
