@@ -313,7 +313,6 @@ python -c '
 import os
 from huggingface_hub import hf_hub_download
 
-# Define the weights to download
 downloads = [
     ("TMElyralab/MuseTalk", "musetalk/musetalk.json", "models/musetalk"),
     ("TMElyralab/MuseTalk", "musetalk/pytorch_model.bin", "models/musetalk"),
@@ -335,7 +334,6 @@ for repo, filename, local_dir in downloads:
     hf_hub_download(repo_id=repo, filename=filename, local_dir=local_dir)
 
 
-# Download ResNet manually (not on HF Hub)
 import urllib.request
 print("Downloading resnet18...")
 os.makedirs("models/face-parse-bisent", exist_ok=True)
@@ -383,7 +381,6 @@ def fix_or_download(repo, filename, expected_path, correct_local_dir_arg):
         # because filename already contains "musetalkV15/"
         hf_hub_download(repo_id=repo, filename=filename, local_dir=correct_local_dir_arg)
 
-# Fix V1.5 UNet
 fix_or_download(
     "TMElyralab/MuseTalk", 
     "musetalkV15/unet.pth", 
@@ -391,7 +388,6 @@ fix_or_download(
     "models" 
 )
 
-# Fix V1.5 Config
 fix_or_download(
     "TMElyralab/MuseTalk", 
     "musetalkV15/musetalk.json", 
@@ -399,15 +395,17 @@ fix_or_download(
     "models"
 )
 
-print("Fix complete. Running prep...")
-'
+
 ------------------------------------------------------------------------------------
 
 
 
-## 6. Phase 2: High-Fidelity Enhancement
+## 6. Phase 2: High-Fidelity Enhancement (important)
 
 If your source video is 1080p or 4K, the standard MuseTalk output (256x256 face crop) might look soft. Use `enhance.py` to fix this.
+
+improve quality significantly (making it more realistic)
+
 
 ### GFPGAN Integration
 
